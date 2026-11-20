@@ -38,13 +38,20 @@ def main(argv):
            or shutil.which("litert-lm"))
     if not cli:
         print("FAILED: litert-lm CLI not found", file=sys.stderr)
-        return 2
+        return 127
     model, prompt = positional
-    proc = subprocess.run(
-        [cli, "run", model, "--prompt", prompt, "--backend", backend,
-         "--max-num-tokens", str(max_tokens), "--top-k", "1", "--cache", "no"],
-        capture_output=True, text=True)
+    try:
+        proc = subprocess.run(
+            [cli, "run", model, "--prompt", prompt, "--backend", backend,
+             "--max-num-tokens", str(max_tokens), "--top-k", "1", "--cache", "no"],
+            capture_output=True, text=True)
+    except OSError as e:
+        print(f"FAILED: could not start litert-lm CLI: {e}", file=sys.stderr)
+        return 127
     sys.stderr.write(proc.stderr)
+    if proc.returncode == 127:
+        print("FAILED: litert-lm command could not start (exit 127)", file=sys.stderr)
+        return 127
     text = strip_channels(proc.stdout).rstrip("\n")
     if proc.returncode != 0 and not text.strip():
         print(f"FAILED: litert-lm exit {proc.returncode}")

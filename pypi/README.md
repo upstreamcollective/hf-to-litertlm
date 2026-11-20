@@ -9,15 +9,16 @@ uvx hf-to-litertlm <org>/<model>                              # -> out/<model>/:
 uvx hf-to-litertlm verify out/<model>/<model>.lock.json       # rebuild from the lock: MATCH = the same bytes
 uvx hf-to-litertlm check out/<model>/<model>_int8.litertlm    # litert-lm 0.18.0, CPU: load + an echo prompt -> PASS / FAIL
 uvx hf-to-litertlm nvidia/parakeet-tdt-0.6b-v3 --smoke        # speech recognition: a Speech2TextMetadata .litertlm (from 0.1.2)
+uvx hf-to-litertlm ./my-finetune                              # Gemma 4 E2B finetune in a local folder, Linux x86-64 (from 0.1.3)
 ```
 
 `uvx` needs [uv](https://docs.astral.sh/uv/); `pip install hf-to-litertlm` pulls uv in as a dependency
-and gives the same `hf-to-litertlm` command. Tested on macOS arm64 only; Linux is untested. On an M4 Max
+and gives the same `hf-to-litertlm` command. `hf-to-litertlm <org>/<model>` is tested on macOS arm64 only. On an M4 Max
 (128 GB), a 1.7B model took 3 to 4 minutes, the gate included, and peaked at 25 GB of RAM;
 gemma-4-E2B-it took 7 minutes and 64 GB
 ([locks/refs/CHANGELOG.md](https://github.com/john-rocky/hf-to-litertlm/blob/main/locks/refs/CHANGELOG.md)).
 
-- **Pinned toolchain.** litert-torch 0.9.4, litert-lm-builder 0.18.0, litert-lm 0.18.0, torch 2.13.0 and
+- **Toolchain for `hf-to-litertlm <org>/<model>`.** litert-torch 0.9.4, litert-lm-builder 0.18.0, litert-lm 0.18.0, torch 2.13.0 and
   transformers 5.14.1, and every other package at the version in the repository's `uv.lock`. The package
   carries the converter scripts with that `pyproject.toml` and `uv.lock` and runs them with
   `uv run --frozen --project ~/.cache/hf-to-litertlm/<version>/`, which gives the environment `uv sync`
@@ -69,6 +70,10 @@ clips, word error rate at most 0.10). The first such run also installs a second 
 writer and the gate (litert-lm-builder 0.19.0, mediapipe 1.2.0). CTC, RNN-T, Whisper, Moonshine and the
 streaming Nemotron models are refused with the reason. Details:
 [docs/asr-route.md](https://github.com/john-rocky/hf-to-litertlm/blob/main/docs/asr-route.md).
+
+**Gemma 4 E2B finetunes in a local folder (from 0.1.3).** `uvx hf-to-litertlm ./my-finetune` converts the Gemma 4 E2B finetune in `./my-finetune` to `out/my-finetune/my-finetune_int4.litertlm` and writes no lock file. It needs Linux x86-64 and at least 22 GiB of available memory (a container with a 24 GiB limit worked). The folder holds merged weights that are not quantized, with their tokenizer and chat template, or a LoRA adapter whose `adapter_config.json` names, by Hugging Face id, a base that is not quantized. The converter stops with one line that says what to do next, before any weight file is downloaded: on any other platform, with less memory, with a folder that holds another Gemma 4 size or another model, or with an adapter whose `adapter_config.json` does not name its base. The `.litertlm` file is text only, with a 2,048-token KV cache. It carries the folder's tokenizer unchanged. The chat template is edited only as far as LiteRT-LM's renderer needs (for the templates tested here, `.get(...)` written as indexing) and checked on test conversations against the prompts that transformers renders from the original template. A template the converter cannot fix this way stops the conversion. An adapter folder that lacks a tokenizer or a chat template takes each missing one from the base. The converter then asks the file the same eight questions as `hf-to-litertlm <org>/<model>` does (litert-lm 0.19.2, CPU, pass = 6 of 8).
+
+On a Google Colab T4 runtime with High-RAM, [Unsloth's Gemma 4 E2B text notebook](https://github.com/unslothai/notebooks/blob/2362e6c4e2024c494277fdf84a289c2e001eae53/nb/Gemma4_(E2B)-Text.ipynb) ran unchanged and saved a LoRA on the attention and MLP layers to `gemma_4_lora`. A pre-release build of 0.1.3 converted `gemma_4_lora` in about 17 minutes, the first-run installs and the eight questions included, and the file got 7 of 8 right on Colab's CPU. On a T4 runtime with standard RAM, an earlier pre-release build found 9.9 GiB of available memory and stopped at the memory check. The public LoRA [3ndetz/zoomerlm-gemma4-e2b](https://huggingface.co/3ndetz/zoomerlm-gemma4-e2b) was also tested in two forms: merged into `unsloth/gemma-4-E2B-it`, and as its adapter folder with `base_model_name_or_path` in its `adapter_config.json` set to `unsloth/gemma-4-E2B-it`. In a linux/amd64 Docker container (x86-64 emulated on an Apple-silicon Mac), both files got 8 of 8 right; the adapter folder's file, made byte for byte the same on Colab, got 7 of 8 right on Colab's CPU. A file made by an earlier pre-release build, identical to the merged folder's file except for its header, also ran on a Pixel 11 Pro's CPU and GPU with LiteRT-LM from its main branch and got 7 of 8 right on each.
 
 The hybrid families that need a patched litert-torch checkout (granite-4.0-h, Falcon-H1, Zamba2,
 Nemotron-H) and the hand-made recipes of the repository's published conversions (`--curated`) run from

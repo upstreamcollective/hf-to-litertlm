@@ -161,16 +161,24 @@ def degenerate(text):
     return False
 
 
+class VerifierStartupError(RuntimeError):
+    pass
+
+
 def run_verifier(verifier, model, prompt, max_tokens, backend=None):
     """Run litert-mac-verify; return (output_text, decode_tok_s). Raises on failure."""
     cmd = [str(verifier), str(model), prompt, "--max-tokens", str(max_tokens)]
+    if Path(verifier).suffix == ".py":
+        cmd.insert(0, sys.executable)
     if backend:
         cmd += ["--backend", backend]
-    proc = subprocess.run(
-        cmd,
-        capture_output=True, text=True, timeout=600,
-    )
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except OSError as e:
+        raise VerifierStartupError(f"could not start verifier: {e}") from e
     combined = proc.stdout + "\n" + proc.stderr
+    if proc.returncode == 127:
+        raise VerifierStartupError(f"verifier or litert-lm command could not start (exit 127)\n{combined[-1500:]}")
     m = re.search(r"^OUTPUT: \[(.*)\]$", combined, re.MULTILINE)
     if not m:
         raise RuntimeError(
@@ -228,7 +236,7 @@ def main():
         print(f"ERROR: verifier not found: {args.verifier}\n"
               f"  build it: swift build -c release --package-path ~/code/litert-mac-verify",
               file=sys.stderr)
-        return 2
+        return 127
 
     name = args.name or model.parent.name
     print(f"== quality gate: {name} ==")
@@ -249,6 +257,9 @@ def main():
                 raw, tok = run_verifier(args.verifier, model, q + SUFFIX,
                                         args.max_tokens + 1200,
                                         backend=args.backend)
+        except VerifierStartupError as e:
+            print(f"FAIL (harness) on '{label}': {e}", file=sys.stderr)
+            return 127
         except Exception as e:  # noqa: BLE001
             print(f"FAIL (harness) on '{label}': {e}", file=sys.stderr)
             return 2

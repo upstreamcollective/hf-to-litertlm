@@ -99,6 +99,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from failure_line import failure, first_line  # noqa: E402
 import asr_route  # noqa: E402
+import gemma4_v2  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INT4_RECIPE = REPO_ROOT / "recipes" / "qwen3_int4_block32_octav.json"
@@ -376,12 +377,18 @@ def in_pinned_env():
     return PINNED_ENV.exists() and Path(sys.prefix).resolve() == PINNED_ENV.resolve()
 
 
+def in_gemma4_env():
+    return Path(sys.prefix).resolve() == (gemma4_v2.PROJECT / ".venv").resolve()
+
+
 def resolve_litert_lm_cli():
     """A litert-lm >= 0.15 CLI: $LITERT_LM_CLI, else the pinned environment's
     own CLI when convert.py runs in it (litert-lm 0.18.0 from uv.lock), else
     the ~/venvs/lt0160run default, else `litert-lm` on PATH (last — which() can
     surface a pyenv shim that exits 127, so the known venv wins)."""
     pinned_cli = Path(sys.executable).parent / "litert-lm"
+    if in_gemma4_env():
+        return str(pinned_cli)
     default_cli = Path.home() / "venvs/lt0160run/bin/litert-lm"
     return (os.environ.get("LITERT_LM_CLI")
             or (str(pinned_cli) if in_pinned_env() and pinned_cli.exists() else None)
@@ -674,15 +681,16 @@ info_path.write_text(json.dumps({
 """
 
 
-def fail(msg, *, stage, context="", code=3):
+def fail(msg, *, stage, context="", code=3, hint=None):
     """Stop with the FAIL line of docs/one-command-lock.md (stage + op or first
     error line + hint), recorded in the open report as `failure`."""
-    f = failure(stage, msg, context=context, **failure_fields())
+    f = failure(stage, msg, context=context, hint=hint, **failure_fields())
     if _REPORT is not None:
         _REPORT["status"] = "failed"
         _REPORT["failure"] = f
         write_report(_REPORT)
-    print(f"ERROR: {msg}", file=sys.stderr)
+    if stage != "route":
+        print(f"ERROR: {msg}", file=sys.stderr)
     print(f["line"], file=sys.stderr)
     sys.exit(code)
 
@@ -829,12 +837,8 @@ def verify_source(report, api, model_id, revision, snap, names, cached):
 
 
 def pin_system_metadata(uuid_value, timestamp):
-    """litert_lm_builder 0.18.0 writes a fresh uuid4() and now() into every
-    bundle header (populate_system_metadata, which LitertLmFileBuilder's
-    _build_sections looks up as a module global), so two honest runs never
-    match byte for byte. Replace it in this process with fixed values; every
-    pack in this process goes through it (the export's own build and the
-    guards' unpack/pack). The caller reads the header back to confirm."""
+    """Override the builder's default UUID and wall time for every pack in
+    this process. LitertLmFileBuilder._build_sections looks up this global."""
     from litert_lm_builder import litertlm_builder as lb
 
     def populate_system_metadata(system_metadata):
@@ -844,6 +848,18 @@ def pin_system_metadata(uuid_value, timestamp):
                                    dtype=lb.DType.STRING)]
 
     lb.populate_system_metadata = populate_system_metadata
+
+
+def gemma4_local_system_metadata(folder, toolchain_id):
+    """Identify the exported checkpoint by its input filenames and contents."""
+    names = pick_source_files(p.name for p in folder.iterdir() if p.is_file())
+    files = [(name, sha256_file(folder / name)) for name in names]
+    identity = json.dumps(["gemma4_v2", toolchain_id, files], separators=(",", ":"))
+    return {
+        "uuid": str(uuid.uuid5(uuid.NAMESPACE_URL, identity)),
+        # Local checkpoints have no pinned commit date. Use a reproducible timestamp.
+        "creation_timestamp": "1970-01-01T00:00:00.000000+00:00",
+    }
 
 
 def read_system_metadata(path):
@@ -897,10 +913,13 @@ def toolchain_info():
         if name:
             pkgs[name] = d.version
     v = lambda n: pkgs.get(n, "none")  # noqa: E731
-    pinned = in_pinned_env()
-    lock = REPO_ROOT / "uv.lock"
+    gemma4 = in_gemma4_env()
+    pinned = gemma4 or in_pinned_env()
+    lock = (gemma4_v2.PROJECT if gemma4 else REPO_ROOT) / "uv.lock"
+    exporter = "litert-torch-nightly" if gemma4 else "litert-torch"
+    builder = "litert-lm-builder-nightly" if gemma4 else "litert-lm-builder"
     return {
-        "id": f"lt{v('litert-torch')}-b{v('litert-lm-builder')}-t{v('torch')}",
+        "id": f"lt{v(exporter)}-b{v(builder)}-t{v('torch')}",
         "python": platform.python_version(),
         "pinned_env": pinned,
         "uv_lock_sha256": sha256_file(lock) if pinned and lock.exists() else None,
@@ -1243,15 +1262,171 @@ def download_and_merge_adapter(report, model_id, base_id, out_dir, revision, bas
     return merged_dir
 
 
+def gemma4_base_files(api, report, source, revision):
+    """List a local adapter's base files before downloading any base weights."""
+    from huggingface_hub.errors import HfHubHTTPError
+
+    if isinstance(source, Path):
+        return None, {p.name for p in source.iterdir() if p.is_file()}
+    try:
+        info = api.model_info(source, revision=revision)
+    except HfHubHTTPError as e:
+        fail(f"could not resolve {source} ({type(e).__name__})", stage="fetch", code=2)
+    if info.gated:
+        refuse(report, "adapter_base_gated", source, GATED_ACTION)
+    return info.sha, {s.rfilename for s in info.siblings}
+
+
+def run_gemma4(args, report, out_dir, name):
+    import tempfile
+    from contextlib import ExitStack
+    from huggingface_hub import HfApi
+
+    report["decisions"].update(route="gemma4_v2", gate_backend="cpu",
+                               quantization="int4_block128_channelwise_embeddings")
+    if not gemma4_v2.supported_platform():
+        fail(gemma4_v2.PLATFORM_REFUSAL, stage="route", code=2, hint=gemma4_v2.PLATFORM_HINT)
+    source = Path(args.model).resolve()
+    if not source.is_dir():
+        fail("the Gemma 4 V2 recipe requires a local model folder", stage="route", code=2)
+    if args.recipe != "int4" or args.task == "asr" or args.curated:
+        fail("a local Gemma 4 E2B folder converts with one fixed int4 recipe, text only",
+             stage="gate", code=2)
+    if not args.check:
+        available = gemma4_v2.available_ram_bytes()
+        report["memory"] = {"available_bytes": available,
+                            "minimum_bytes": gemma4_v2.MIN_RAM_GIB * 2**30,
+                            "minimum_source": gemma4_v2.RAM_FLOOR_SOURCE}
+        if reason := gemma4_v2.ram_refusal(available):
+            fail(reason, stage="route", code=2, hint=gemma4_v2.RAM_HINT)
+
+    files = {p.name for p in source.iterdir() if p.is_file()}
+    is_adapter = "adapter_config.json" in files
+    model, model_sha, model_files = source, None, files
+    if is_adapter:
+        adapter = gemma4_v2.source_json(source, "adapter_config.json")
+        model = gemma4_v2.adapter_base(source, adapter)
+        api = HfApi()
+        model_sha, model_files = gemma4_base_files(api, report, model, adapter.get("revision"))
+        report["decisions"]["adapter"] = {"base": str(model), "revision": model_sha,
+                                         "device": "cpu", "merge_dtype": "float32"}
+        if not {"adapter_model.safetensors", "adapter_model.bin"}.intersection(files):
+            refuse(report, "no_weights", "adapter_config.json has no adapter weights",
+                   "pass the LoRA folder with its adapter_model.safetensors or adapter_model.bin")
+    cfg = gemma4_v2.source_json(model, "config.json", model_sha)
+    report["decisions"]["model_type"] = cfg.get("model_type")
+    if not gemma4_v2.is_e2b(cfg):
+        fail(gemma4_v2.E2B_ONLY, stage="route", code=2)
+    if cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config"):
+        refuse(report, "pre_quantized", "Gemma 4 weights are already quantized",
+               "pass the full-precision merged checkpoint or a LoRA with a full-precision base")
+    names = pick_source_files(model_files)
+    if not any(n.endswith((".safetensors", ".bin")) for n in names):
+        refuse(report, "no_weights", "no safetensors/bin weight files in the checkpoint",
+               "pass the merged checkpoint or a LoRA adapter with a complete base")
+    report["decisions"]["lock"] = False
+    if args.check:
+        report["status"] = "accepted"
+        write_report(report)
+        print(json.dumps(report, indent=2))
+        return
+
+    toolchain = toolchain_info()
+    report["toolchain"] = {k: toolchain[k] for k in ("id", "python", "pinned_env", "uv_lock_sha256")}
+    bundle = out_dir / f"{name}_int4.litertlm"
+    child = [sys.executable, str(Path(gemma4_v2.__file__).resolve())]
+    with ExitStack() as stack:
+        if is_adapter:
+            try:
+                gemma4_v2.validate_adapter(source)
+            except ValueError as e:
+                fail(str(e), stage="load", hint=(
+                    "save or download the adapter again because its weights are incomplete or damaged"))
+        export_src = model
+        if is_adapter:
+            if not isinstance(model, Path):
+                export_src, cached = download_source(report, model, model_sha, names)
+                verify_source(report, api, model, model_sha, export_src, names, cached)
+            if args.keep_merged:
+                merged = Path(tempfile.mkdtemp(prefix="gemma4-merged-", dir=out_dir))
+            else:
+                merged = Path(stack.enter_context(tempfile.TemporaryDirectory(
+                    prefix=".gemma4-merged-", dir=out_dir)))
+            report["stage"] = "load"
+            report["decisions"]["adapter"]["merged_dir"] = str(merged)
+            write_report(report)
+            if subprocess.run([*child, "merge", str(export_src), str(source),
+                               str(merged)]).returncode:
+                fail("PEFT CPU merge failed; see the traceback above", stage="load")
+            export_src = merged
+        export_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(
+            prefix=".gemma4-export-", dir=out_dir)))
+        report["stage"] = "template"
+        try:
+            template_proof = gemma4_v2.prepare_template(
+                export_src, export_dir / "chat_template.bundle.jinja")
+        except ValueError as e:
+            fail(str(e), stage="template")
+        report["decisions"]["template"] = template_proof
+        if not template_proof["pass"]:
+            fail(template_proof["reason"], stage="template")
+        try:
+            metadata = gemma4_local_system_metadata(export_src, toolchain["id"])
+        except OSError as e:
+            fail(f"could not fingerprint the export checkpoint: {e}", stage="load",
+                 hint="check that the checkpoint files are readable")
+        report["decisions"]["system_metadata"] = metadata
+        report["stage"] = "convert"
+        report["export_call"] = gemma4_v2.format_export(export_src, export_dir)
+        write_report(report)
+        print(report["export_call"])
+        t0 = time.monotonic()
+        proc = subprocess.run([*child, "export", str(export_src), str(export_dir),
+                               metadata["uuid"], metadata["creation_timestamp"]],
+                              env=dict(os.environ, HF_HUB_OFFLINE="1"))
+        report["export_seconds"] = round(time.monotonic() - t0, 1)
+        exported = export_dir / "model.litertlm"
+        if proc.returncode:
+            fail(f"the Gemma 4 exporter exited {proc.returncode}; see the traceback above",
+                 stage="convert")
+        if not exported.is_file():
+            fail("the Gemma 4 exporter produced no model.litertlm", stage="bundle")
+
+        # Use the notebook's structural check against the raw export before moving the bundle.
+        report["stage"] = "bundle"
+        rewritten = export_dir / "model.fp32.litertlm"
+        write_report(report)
+        fix = subprocess.run(gemma4_v2.fix_command(sys.executable, exported, rewritten),
+                             capture_output=True, text=True)
+        print(fix.stdout, end="")
+        if fix.returncode:
+            lines = fix.stderr.strip().splitlines()
+            reason = next((line for line in lines if line.startswith(("refused:", "ERROR:"))),
+                          lines[-1] if lines else f"bf16to32.py exited {fix.returncode}")
+            fail(reason, stage="bundle", context=fix.stdout + fix.stderr)
+        if not rewritten.is_file():
+            fail("bf16to32.py produced no checked bundle", stage="bundle")
+        fix_report = out_dir / f"{bundle.stem}.bf16to32.json"
+        rewritten.with_suffix(".bf16to32.json").replace(fix_report)
+        rewritten.replace(bundle)
+        report["decisions"]["bf16to32"] = {"report": str(fix_report), "checked_input": True}
+
+    report.update(bundle=str(bundle), bundle_bytes=bundle.stat().st_size,
+                  bundle_export_name="model.litertlm")
+    # Both existing gate adapters call this recipe's runtime, even if the caller has set a CLI.
+    os.environ["LITERT_LM_CLI"] = str(Path(sys.executable).parent / "litert-lm")
+    finish_conversion(args, report, out_dir, bundle, None, None, gate_backend="cpu")
+
+
 def main():
     global _REPORT
     sys.stdout.reconfigure(line_buffering=True)  # keep stdout in step with the exporter's stderr in a log
     ap = argparse.ArgumentParser()
-    ap.add_argument("model", help="HF model id, e.g. org/name")
+    ap.add_argument("model", help="HF model id (org/name), or a local Gemma 4 E2B folder")
     ap.add_argument("--revision",
                     help="commit sha, branch or tag to convert (default: main, resolved "
                          "to its commit sha; the lock records the sha)")
-    ap.add_argument("--recipe", choices=sorted(RECIPES), default="int8",
+    ap.add_argument("--recipe", choices=sorted(RECIPES),
                     help="int8 = the export's dynamic_wi8_afp32 (default); int4 = the "
                          "proven blockwise-32 OCTAV recipe with an int8 embedding")
     ap.add_argument("--int4", action="store_true", help="alias of --recipe int4")
@@ -1290,9 +1465,11 @@ def main():
     args = ap.parse_args()
     if args.int4:
         args.recipe = "int4"
+    gemma4 = in_gemma4_env()
+    args.recipe = args.recipe or ("int4" if gemma4 else "int8")
     args.int4 = args.recipe == "int4"
 
-    name = args.model.split("/")[-1]
+    name = Path(args.model).resolve().name if gemma4 and Path(args.model).is_dir() else args.model.split("/")[-1]
     out_dir = Path(args.out) if args.out else OUT_ROOT / name
     if args.smoke and args.max_minutes is None:
         args.max_minutes = 45
@@ -1312,6 +1489,8 @@ def main():
     write_report(report)
     # hf_xet stalls on multi-GB downloads on this host; plain HTTP is set before the import
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    if gemma4:
+        return run_gemma4(args, report, out_dir, name)
 
     # ---------------- entry gate ----------------
     from huggingface_hub import HfApi
@@ -1612,7 +1791,13 @@ def main():
         else:
             print("NOTE: no lock for this source (adapter merge / rope-normalized source)")
     report["bundle"] = str(bundle)
+    finish_conversion(args, report, out_dir, bundle, lock, lock_path, recipe=recipe,
+                      gate_backend=gate_backend, is_think=is_think, merged_dir=merged_dir,
+                      normalized_dir=normalized_dir)
 
+
+def finish_conversion(args, report, out_dir, bundle, lock, lock_path, *, recipe=None,
+                      gate_backend=None, is_think=False, merged_dir=None, normalized_dir=None):
     if args.no_gate:
         report["status"] = "built"
         report["stage"] = None
@@ -1660,7 +1845,7 @@ def main():
             env = dict(os.environ, LITERT_LM_CLI=cli or "")
         print("exit gate: " + " ".join(gate_cmd[1:]))
         proc = subprocess.run(gate_cmd, text=True, env=env)
-        gate = json.loads(gate_json.read_text()) if gate_json.exists() else None
+        gate = json.loads(gate_json.read_text()) if proc.returncode != 127 and gate_json.exists() else None
         report["gate"] = {k: gate[k] for k in ("score", "of", "degenerate", "passed")} if gate else None
         if report["gate"] is not None and not recipe:
             report["gate"]["engine"] = "litert-lm CLI (scripts/litert_lm_cli_verifier.py)"
@@ -1669,13 +1854,17 @@ def main():
     report["gate_seconds"] = round(time.time() - t0)
 
     # ---------------- check (the pinned CLI loads it and the user's text reaches the model) ----------------
-    checked = report["gate"]["smoke"] if args.smoke else check_bundle(bundle)
-    report["check"] = {k: checked[k] for k in ("engine", "backend", "seconds", "answer_head", "pass",
-                                               "arithmetic")}
-    if lock is not None:
-        lock["check"] = {k: checked[k] for k in ("engine", "backend", "prompt", "answer_head",
-                                                 "pass", "seconds", "arithmetic")}
-        write_lock(lock_path, lock)
+    startup_failed = proc is not None and proc.returncode == 127
+    if startup_failed:
+        report["check"] = None
+    else:
+        checked = report["gate"]["smoke"] if args.smoke else check_bundle(bundle)
+        report["check"] = {k: checked[k] for k in ("engine", "backend", "seconds", "answer_head", "pass",
+                                                   "arithmetic")}
+        if lock is not None:
+            lock["check"] = {k: checked[k] for k in ("engine", "backend", "prompt", "answer_head",
+                                                     "pass", "seconds", "arithmetic")}
+            write_lock(lock_path, lock)
 
     if args.smoke:
         report["status"] = "smoke_pass" if passed else "smoke_failed"
@@ -1686,7 +1875,12 @@ def main():
     else:
         report["status"] = "converted_pass"
     report["stage"] = None
-    if args.smoke or (passed and not checked["pass"]):
+    if startup_failed:
+        report["failure"] = failure(
+            "generate", "the 8-question check could not start its verifier or the litert-lm command (exit 127)",
+            hint="restore the pinned litert-lm command in the conversion environment and rerun the gate",
+            **failure_fields())
+    elif args.smoke or (passed and not checked["pass"]):
         report["failure"] = checked.get("failure") and {**checked["failure"], **failure_fields()}
     elif not passed:
         g = report["gate"] or {}

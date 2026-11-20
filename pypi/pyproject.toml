@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hf-to-litertlm"
-version = "0.1.2"
+version = "0.1.3"
 description = "One command from a Hugging Face model repo to a .litertlm bundle for LiteRT-LM, on a pinned toolchain; rebuilding from its lock file gives the same bytes"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -17,11 +17,12 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 # the launcher runs the converter with `uv run --frozen` on the repo's uv.lock (hf_to_litertlm/cli.py)
-dependencies = ["uv>=0.11"]
+dependencies = ["uv>=0.11", "huggingface-hub>=0.31"]
 
 [project.urls]
 Homepage = "https://github.com/john-rocky/hf-to-litertlm"

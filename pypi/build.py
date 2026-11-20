@@ -9,6 +9,7 @@ The launcher unpacks them and runs scripts/convert.py with `uv run --frozen`, so
 every file the one-command path opens. A package or payload file with uncommitted changes stops the
 build: the wheel is always a commit of this repo.
 """
+import argparse
 import hashlib
 import io
 import json
@@ -32,6 +33,11 @@ PAYLOAD = [
     # the speech recognition route (convert.py imports asr_route; asr/ is its second uv project)
     "scripts/asr_route.py", "asr/export_parakeet_tdt.py", "asr/pack_speech2text.py", "asr/smoke.py",
     "asr/pyproject.toml", "asr/uv.lock",
+    "scripts/gemma4_v2.py", "recipes/gemma4_v2/pyproject.toml", "recipes/gemma4_v2/uv.lock",
+    "recipes/gemma4_v2/int4_block128.json",
+    "notebooks/unsloth_gemma4_e2b/requirements.txt",
+    "notebooks/unsloth_gemma4_e2b/gemma4_to_litertlm.py",
+    "notebooks/unsloth_gemma4_e2b/bf16to32.py",
 ]
 PACKAGE_FILES = ["pyproject.toml", "README.md", "hf_to_litertlm/__init__.py",
                  "hf_to_litertlm/__main__.py", "hf_to_litertlm/cli.py"]
@@ -72,8 +78,12 @@ def payload_zip():
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--out-dir", type=Path, default=HERE / "dist")
+    parser.add_argument("--wheel", action="store_true", help="build only the wheel")
+    args = parser.parse_args()
     data, manifest = payload_zip()
-    dist = HERE / "dist"
+    dist = args.out_dir.resolve()
     with tempfile.TemporaryDirectory(prefix="hf-to-litertlm-build-") as td:
         stage = Path(td)
         for rel in PACKAGE_FILES:
@@ -81,7 +91,10 @@ def main():
             shutil.copyfile(HERE / rel, stage / rel)
         shutil.copyfile(REPO / "LICENSE", stage / "LICENSE")
         (stage / "hf_to_litertlm" / "payload.zip").write_bytes(data)
-        subprocess.run(["uv", "build", "--out-dir", str(dist), str(stage)], check=True)
+        cmd = ["uv", "build", "--out-dir", str(dist)]
+        if args.wheel:
+            cmd.append("--wheel")
+        subprocess.run([*cmd, str(stage)], check=True)
     print(f"payload: {len(manifest['files'])} files at {manifest['commit'][:12]}, "
           f"payload.zip {len(data):,} B sha256 {hashlib.sha256(data).hexdigest()}")
     for f in sorted(dist.iterdir()):
